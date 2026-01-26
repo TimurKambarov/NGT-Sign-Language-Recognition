@@ -239,18 +239,7 @@ def calculate_relative_position(hand_data, face_refs):
     }
 
 
-def normalize_landmarks_to_wrist(landmarks, include_z=False):
-    """
-    Normalize all landmarks relative to wrist position.
-    Makes hand shape recognition independent of hand position in frame.
-    
-    Args:
-        landmarks: List of 21 landmark dicts with x, y, z
-        include_z: If False (default), only return x, y coordinates
-    
-    Returns list of 21 dicts with wrist at origin.
-    """
-    
+def normalize_landmarks_to_wrist(landmarks, include_z=True):
     wrist = landmarks[0]
     normalized = []
     
@@ -258,10 +247,9 @@ def normalize_landmarks_to_wrist(landmarks, include_z=False):
         norm_lm = {
             'id': lm['id'],
             'x': lm['x'] - wrist['x'],
-            'y': lm['y'] - wrist['y']
+            'y': lm['y'] - wrist['y'],
+            'z': lm['z'] - wrist['z']  # Always included now
         }
-        if include_z:
-            norm_lm['z'] = lm['z'] - wrist['z']
         normalized.append(norm_lm)
     
     return normalized

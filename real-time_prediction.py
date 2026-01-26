@@ -1,21 +1,14 @@
 """
 NGT Sign Language Recognition - Real-Time Prediction
-Recognizes static hand gestures using trained Random Forest model.
-
-Features:
-    - Real-time hand landmark detection
-    - Letter prediction with confidence display
-    - Stabilized predictions (reduces flickering)
-    - Signing zone validation
-    - Display on webcam window + console output
+Uses sliding window with 63 features (21 landmarks × 3 coordinates).
 
 Controls:
-    - Press 'q' to quit
-    - Press 'm' to toggle mirror mode
-    - Press 'z' to toggle signing zone visibility
+    Q - Quit
+    M - Toggle mirror mode
+    Z - Toggle signing zone visibility
 
 Usage:
-    python realtime_prediction.py
+    python real_time_prediction.py
 """
 
 import cv2
@@ -24,34 +17,39 @@ import joblib
 import os
 from collections import deque
 
-import hand_face_detection as detection
+try:
+    import hand_face_detection as detection
+except ImportError:
+    print("Error: hand_face_detection.py not found in current directory.")
+    print("Make sure you're running from the repository root.")
+    exit(1)
 
 
 # =============================================================================
-# CONFIGURATION (Adjust these parameters as needed)
+# CONFIGURATION
 # =============================================================================
 
 # Model path
 MODEL_PATH = "models/random_forest.joblib"
 
-# Prediction stabilization
-# Only display prediction when same letter detected N times in a row
-STABILITY_THRESHOLD = 10
+# Sliding window settings
+WINDOW_SIZE = 5          # Number of frames to average
+MIN_FRAMES = 5          # Minimum frames before predicting
 
-# Confidence threshold
-# Only display prediction if confidence >= this value (0.0 to 1.0)
-CONFIDENCE_THRESHOLD = 0.60
+# Prediction settings
+PREDICTION_INTERVAL = 3   # Predict every N frames
+STABILITY_COUNT = 5       # Same prediction N times = stable
+CONFIDENCE_THRESHOLD = 0.75
 
 # Signing zone boundaries (relative to face)
-# Hand must be within this zone for predictions to be made
 SIGNING_ZONE = {
-    'x_min': -2.5,   # Left boundary (face widths from nose)
-    'x_max': 2.5,    # Right boundary
-    'y_min': -0.7,   # Upper boundary (above nose)
-    'y_max': 1.7,    # Lower boundary (below nose)
+    'x_min': -2.5,
+    'x_max': 2.5,
+    'y_min': -0.7,
+    'y_max': 1.7,
 }
 
-# Display settings
+# Display
 DISPLAY_FONT = cv2.FONT_HERSHEY_SIMPLEX
 COLOR_GREEN = (0, 255, 0)
 COLOR_RED = (0, 0, 255)
@@ -66,55 +64,63 @@ COLOR_ORANGE = (0, 165, 255)
 # =============================================================================
 
 def load_model(model_path):
-    """Load trained model from file."""
+    """Load trained model."""
     if not os.path.exists(model_path):
         raise FileNotFoundError(
             f"Model not found: {model_path}\n"
-            "Run train_model.ipynb first to train and save the model."
+            "Run train_model.ipynb first."
         )
     
     model = joblib.load(model_path)
-    print(f"Model loaded from {model_path}")
+    print(f"Model loaded: {model_path}")
     return model
 
 
 # =============================================================================
-# PREDICTION
+# SLIDING WINDOW (63 features)
 # =============================================================================
 
-def landmarks_to_features(landmarks_normalized):
+class SlidingWindow:
     """
-    Convert normalized landmarks to feature array for model input.
+    Maintains sliding window of frames.
+    Averages frames to produce 63 features for prediction.
+    """
     
-    Args:
-        landmarks_normalized: List of 21 dicts with 'x', 'y' keys
+    def __init__(self, max_size=15):
+        self.max_size = max_size
+        self.frames = deque(maxlen=max_size)
     
-    Returns:
-        numpy array of shape (1, 42)
-    """
-    features = []
-    for lm in landmarks_normalized:
-        features.append(lm['x'])
-        features.append(lm['y'])
-    return np.array(features).reshape(1, -1)
-
-
-def predict_letter(model, landmarks_normalized):
-    """
-    Predict letter from landmarks.
+    def add_frame(self, landmarks_normalized):
+        """Add a frame (21 landmarks with x, y, z)."""
+        frame_data = []
+        for lm in landmarks_normalized:
+            frame_data.extend([lm['x'], lm['y'], lm['z']])
+        self.frames.append(frame_data)
     
-    Returns:
-        (predicted_letter, confidence) or (None, 0.0) if prediction fails
-    """
-    try:
-        features = landmarks_to_features(landmarks_normalized)
-        prediction = model.predict(features)[0]
-        probabilities = model.predict_proba(features)[0]
-        confidence = probabilities.max()
-        return prediction, confidence
-    except Exception as e:
-        print(f"Prediction error: {e}")
-        return None, 0.0
+    def clear(self):
+        """Clear all frames."""
+        self.frames.clear()
+    
+    def is_ready(self, min_frames=10):
+        """Check if enough frames collected."""
+        return len(self.frames) >= min_frames
+    
+    def get_features(self):
+        """
+        Average all frames in window to get 63 features.
+        Returns numpy array of shape (1, 63).
+        """
+        if len(self.frames) == 0:
+            return None
+        
+        # Stack all frames and compute mean
+        data = np.array(list(self.frames))  # Shape: (num_frames, 63)
+        averaged = np.mean(data, axis=0)    # Shape: (63,)
+        
+        return averaged.reshape(1, -1)
+    
+    def __len__(self):
+        return len(self.frames)
 
 
 # =============================================================================
@@ -122,58 +128,39 @@ def predict_letter(model, landmarks_normalized):
 # =============================================================================
 
 class PredictionStabilizer:
-    """
-    Stabilizes predictions by requiring N consecutive same predictions.
-    Reduces flickering between letters.
-    """
+    """Requires N consecutive same predictions for stability."""
     
-    def __init__(self, threshold=10):
-        self.threshold = threshold
-        self.history = deque(maxlen=threshold)
-        self.stable_prediction = None
+    def __init__(self, required_count=5):
+        self.required_count = required_count
+        self.history = deque(maxlen=required_count)
+        self.stable_letter = None
         self.stable_confidence = 0.0
     
-    def update(self, prediction, confidence):
-        """
-        Update with new prediction.
+    def update(self, letter, confidence):
+        """Update with new prediction."""
+        self.history.append((letter, confidence))
         
-        Returns:
-            (stable_letter, stable_confidence, is_stable)
-        """
-        self.history.append((prediction, confidence))
+        if len(self.history) >= self.required_count:
+            letters = [h[0] for h in self.history]
+            if all(l == letters[0] for l in letters):
+                self.stable_letter = letters[0]
+                self.stable_confidence = np.mean([h[1] for h in self.history])
         
-        # Check if all recent predictions are the same
-        if len(self.history) == self.threshold:
-            predictions = [p[0] for p in self.history]
-            
-            if all(p == predictions[0] and p is not None for p in predictions):
-                self.stable_prediction = predictions[0]
-                self.stable_confidence = np.mean([p[1] for p in self.history])
-                return self.stable_prediction, self.stable_confidence, True
-        
-        return self.stable_prediction, self.stable_confidence, False
+        return self.stable_letter, self.stable_confidence
     
     def reset(self):
-        """Reset the stabilizer."""
+        """Reset stabilizer."""
         self.history.clear()
-        self.stable_prediction = None
+        self.stable_letter = None
         self.stable_confidence = 0.0
 
 
 # =============================================================================
-# SIGNING ZONE CHECK
+# SIGNING ZONE
 # =============================================================================
 
 def is_in_signing_zone(relative_position):
-    """
-    Check if hand is within the signing zone.
-    
-    Args:
-        relative_position: Dict with 'rel_x', 'rel_y' keys
-    
-    Returns:
-        bool
-    """
+    """Check if hand is in signing zone."""
     if relative_position is None:
         return False
     
@@ -184,12 +171,8 @@ def is_in_signing_zone(relative_position):
             SIGNING_ZONE['y_min'] <= y <= SIGNING_ZONE['y_max'])
 
 
-# =============================================================================
-# DISPLAY FUNCTIONS
-# =============================================================================
-
 def draw_signing_zone(frame, face_refs, show_zone=True):
-    """Draw signing zone rectangle based on face position."""
+    """Draw signing zone rectangle."""
     if not show_zone or face_refs is None:
         return frame
     
@@ -203,86 +186,65 @@ def draw_signing_zone(frame, face_refs, show_zone=True):
     y2 = int(nose[1] + SIGNING_ZONE['y_max'] * fh)
     
     cv2.rectangle(frame, (x1, y1), (x2, y2), COLOR_YELLOW, 2)
-    
     return frame
 
 
-def draw_prediction(frame, letter, confidence, is_stable, in_zone):
-    """Draw prediction result on frame."""
+# =============================================================================
+# DISPLAY
+# =============================================================================
+
+def draw_prediction_box(frame, letter, confidence, window_size, in_zone):
+    """Draw prediction result box."""
     h, w, _ = frame.shape
     
-    # Main prediction display area (top-right corner)
-    box_x = w - 200
-    box_y = 10
-    box_w = 190
-    box_h = 120
+    box_x, box_y = w - 200, 10
+    box_w, box_h = 190, 130
     
     # Background
     cv2.rectangle(frame, (box_x, box_y), (box_x + box_w, box_y + box_h), (0, 0, 0), -1)
     cv2.rectangle(frame, (box_x, box_y), (box_x + box_w, box_y + box_h), COLOR_WHITE, 2)
     
+    # Window fill bar
+    fill_pct = min(window_size / WINDOW_SIZE, 1.0)
+    bar_width = int((box_w - 20) * fill_pct)
+    cv2.rectangle(frame, (box_x + 10, box_y + box_h - 20),
+                 (box_x + 10 + bar_width, box_y + box_h - 10), COLOR_CYAN, -1)
+    cv2.rectangle(frame, (box_x + 10, box_y + box_h - 20),
+                 (box_x + box_w - 10, box_y + box_h - 10), COLOR_WHITE, 1)
+    
     if not in_zone:
-        # Hand not in zone
-        cv2.putText(frame, "MOVE HAND", (box_x + 20, box_y + 50),
-                   DISPLAY_FONT, 0.7, COLOR_ORANGE, 2)
-        cv2.putText(frame, "INTO ZONE", (box_x + 25, box_y + 80),
-                   DISPLAY_FONT, 0.7, COLOR_ORANGE, 2)
+        cv2.putText(frame, "MOVE HAND", (box_x + 25, box_y + 45),
+                   DISPLAY_FONT, 0.6, COLOR_RED, 2)
+        cv2.putText(frame, "INTO ZONE", (box_x + 30, box_y + 70),
+                   DISPLAY_FONT, 0.6, COLOR_RED, 2)
     elif letter is None:
-        # No stable prediction yet
-        cv2.putText(frame, "DETECTING", (box_x + 20, box_y + 50),
-                   DISPLAY_FONT, 0.7, COLOR_YELLOW, 2)
-        cv2.putText(frame, "...", (box_x + 80, box_y + 80),
-                   DISPLAY_FONT, 0.7, COLOR_YELLOW, 2)
+        cv2.putText(frame, "Detecting...", (box_x + 30, box_y + 55),
+                   DISPLAY_FONT, 0.6, COLOR_YELLOW, 2)
     elif confidence < CONFIDENCE_THRESHOLD:
-        # Low confidence
-        cv2.putText(frame, f"{letter}?", (box_x + 60, box_y + 70),
-                   DISPLAY_FONT, 2.0, COLOR_ORANGE, 3)
-        cv2.putText(frame, f"{confidence:.0%} LOW", (box_x + 40, box_y + 100),
+        cv2.putText(frame, f"{letter}?", (box_x + 60, box_y + 60),
+                   DISPLAY_FONT, 1.8, COLOR_ORANGE, 3)
+        cv2.putText(frame, f"{confidence:.0%}", (box_x + 70, box_y + 90),
                    DISPLAY_FONT, 0.5, COLOR_ORANGE, 1)
     else:
-        # Good prediction
-        color = COLOR_GREEN if is_stable else COLOR_CYAN
-        cv2.putText(frame, letter, (box_x + 60, box_y + 75),
-                   DISPLAY_FONT, 2.5, color, 4)
-        cv2.putText(frame, f"{confidence:.0%}", (box_x + 70, box_y + 105),
-                   DISPLAY_FONT, 0.6, color, 2)
+        cv2.putText(frame, letter, (box_x + 60, box_y + 65),
+                   DISPLAY_FONT, 2.2, COLOR_GREEN, 4)
+        cv2.putText(frame, f"{confidence:.0%}", (box_x + 70, box_y + 95),
+                   DISPLAY_FONT, 0.6, COLOR_GREEN, 2)
     
     return frame
 
 
-def draw_status(frame, face_detected, hand_detected, in_zone, mirrored, show_zone):
-    """Draw status bar at bottom of frame."""
+def draw_status_bar(frame, face_ok, hand_ok, in_zone, mirrored, fps):
+    """Draw status bar at bottom."""
     h, w, _ = frame.shape
     
-    # Status bar background
-    cv2.rectangle(frame, (10, h - 40), (500, h - 10), (0, 0, 0), -1)
-    cv2.rectangle(frame, (10, h - 40), (500, h - 10), COLOR_WHITE, 1)
+    cv2.rectangle(frame, (10, h - 35), (500, h - 10), (0, 0, 0), -1)
     
-    # Status indicators
-    face_color = COLOR_GREEN if face_detected else COLOR_RED
-    hand_color = COLOR_GREEN if hand_detected else COLOR_RED
-    zone_color = COLOR_GREEN if in_zone else COLOR_RED
+    status = f"Face:{'OK' if face_ok else 'NO'} Hand:{'OK' if hand_ok else 'NO'} "
+    status += f"Zone:{'OK' if in_zone else 'NO'} Mirror:{'ON' if mirrored else 'OFF'} FPS:{fps:.0f}"
     
-    status_text = (
-        f"Face: {'OK' if face_detected else 'NO'} | "
-        f"Hand: {'OK' if hand_detected else 'NO'} | "
-        f"Zone: {'OK' if in_zone else 'NO'} | "
-        f"Mirror: {'ON' if mirrored else 'OFF'} (m) | "
-        f"Zone: {'ON' if show_zone else 'OFF'} (z)"
-    )
-    
-    cv2.putText(frame, status_text, (20, h - 18),
-               DISPLAY_FONT, 0.4, COLOR_WHITE, 1)
-    
-    return frame
-
-
-def draw_controls(frame):
-    """Draw control hints."""
-    h, w, _ = frame.shape
-    
-    cv2.putText(frame, "Press 'q' to quit", (10, 25),
-               DISPLAY_FONT, 0.5, COLOR_WHITE, 1)
+    cv2.putText(frame, status, (15, h - 17), DISPLAY_FONT, 0.4, COLOR_WHITE, 1)
+    cv2.putText(frame, "Q=quit M=mirror Z=zone", (350, h - 17), DISPLAY_FONT, 0.35, (150, 150, 150), 1)
     
     return frame
 
@@ -292,21 +254,17 @@ def draw_controls(frame):
 # =============================================================================
 
 def main():
-    """Main real-time prediction loop."""
-    
-    print("=" * 60)
-    print("NGT Sign Language Recognition - Real-Time Prediction")
-    print("=" * 60)
-    print(f"Stability threshold: {STABILITY_THRESHOLD} frames")
-    print(f"Confidence threshold: {CONFIDENCE_THRESHOLD:.0%}")
-    print("=" * 60)
     
     # Load model
-    print("\nLoading model...")
     model = load_model(MODEL_PATH)
     
-    # Initialize MediaPipe
-    print("Initializing detection...")
+    # Check model expects 63 features
+    if hasattr(model, 'n_features_in_'):
+        print(f"Model expects {model.n_features_in_} features")
+        if model.n_features_in_ != 63:
+            print(f"WARNING: Model expects {model.n_features_in_} features, not 63!")
+    
+    # Initialize detection
     mp_resources = detection.initialize_mediapipe()
     
     # Initialize webcam
@@ -318,19 +276,22 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     
-    # Initialize stabilizer
-    stabilizer = PredictionStabilizer(threshold=STABILITY_THRESHOLD)
-    
     # State
+    window = SlidingWindow(max_size=WINDOW_SIZE)
+    stabilizer = PredictionStabilizer(required_count=STABILITY_COUNT)
+    
     mirrored = True
     show_zone = True
+    frame_count = 0
     last_printed_letter = None
     
-    print("\nReady! Controls:")
-    print("  q - Quit")
-    print("  m - Toggle mirror mode")
-    print("  z - Toggle signing zone display")
-    print()
+    # FPS tracking
+    fps = 0
+    fps_counter = 0
+    fps_start = cv2.getTickCount()
+    
+    print("\nReady! Controls: Q=quit, M=mirror, Z=zone")
+    print("Predictions appear automatically when hand is in zone.\n")
     
     while True:
         ret, frame = cap.read()
@@ -343,68 +304,82 @@ def main():
         # Detect face and hands
         frame, face_refs, hands_data = detection.process_frame(frame, mp_resources)
         
-        # State tracking
-        face_detected = face_refs is not None
-        hand_detected = len(hands_data) > 0
+        face_ok = face_refs is not None
+        hand_ok = len(hands_data) > 0
         in_zone = False
-        current_prediction = None
-        current_confidence = 0.0
         
         # Process hand if detected
-        if hand_detected and face_detected:
-            hand_data = hands_data[0]  # Use first detected hand
+        if hand_ok and face_ok:
+            hand_data = hands_data[0]
             rel_pos = hand_data.get('relative_position')
-            
             in_zone = is_in_signing_zone(rel_pos)
             
             if in_zone:
-                # Get prediction
-                landmarks_norm = hand_data['landmarks_normalized']
-                current_prediction, current_confidence = predict_letter(model, landmarks_norm)
-        
-        # Update stabilizer
-        if in_zone and current_prediction is not None:
-            stable_letter, stable_confidence, is_stable = stabilizer.update(
-                current_prediction, current_confidence
-            )
+                # Add frame to sliding window
+                window.add_frame(hand_data['landmarks_normalized'])
+                
+                # Predict every N frames
+                if frame_count % PREDICTION_INTERVAL == 0 and window.is_ready(MIN_FRAMES):
+                    features = window.get_features()
+                    
+                    if features is not None:
+                        # Predict
+                        prediction = model.predict(features)[0]
+                        proba = model.predict_proba(features)[0]
+                        confidence = proba.max()
+                        
+                        # Stabilize
+                        stable_letter, stable_conf = stabilizer.update(prediction, confidence)
+                        
+                        # Print on change
+                        if stable_letter != last_printed_letter and stable_letter is not None:
+                            if stable_conf >= CONFIDENCE_THRESHOLD:
+                                print(f"Detected: {stable_letter} ({stable_conf:.0%})")
+                                last_printed_letter = stable_letter
+            else:
+                # Hand left zone
+                window.clear()
+                stabilizer.reset()
+                last_printed_letter = None
         else:
+            # No detection
+            window.clear()
             stabilizer.reset()
-            stable_letter, stable_confidence, is_stable = None, 0.0, False
-        
-        # Print to console (only when stable prediction changes)
-        if (stable_letter is not None and 
-            stable_confidence >= CONFIDENCE_THRESHOLD and
-            stable_letter != last_printed_letter):
-            print(f"Detected: {stable_letter} ({stable_confidence:.0%})")
-            last_printed_letter = stable_letter
-        
-        # Reset last printed if hand leaves zone
-        if not in_zone:
             last_printed_letter = None
         
-        # Draw UI elements
+        # Get display values
+        display_letter = stabilizer.stable_letter
+        display_confidence = stabilizer.stable_confidence
+        
+        # Draw UI
         frame = draw_signing_zone(frame, face_refs, show_zone)
-        frame = draw_prediction(frame, stable_letter, stable_confidence, is_stable, in_zone)
-        frame = draw_status(frame, face_detected, hand_detected, in_zone, mirrored, show_zone)
-        frame = draw_controls(frame)
+        frame = draw_prediction_box(frame, display_letter, display_confidence, len(window), in_zone)
+        frame = draw_status_bar(frame, face_ok, hand_ok, in_zone, mirrored, fps)
         
-        # Draw hand landmarks
-        if hands_data:
-            for hand_data in hands_data:
-                center = hand_data['center_px']
-                color = COLOR_GREEN if in_zone else COLOR_RED
-                cv2.circle(frame, center, 10, color, -1)
+        # Hand indicator
+        if hand_ok:
+            center = hands_data[0]['center_px']
+            color = COLOR_GREEN if in_zone else COLOR_RED
+            cv2.circle(frame, center, 8, color, -1)
         
-        # Show frame
         cv2.imshow('NGT Sign Language Recognition', frame)
         
-        # Handle keyboard input
+        # FPS calculation
+        frame_count += 1
+        fps_counter += 1
+        if fps_counter >= 30:
+            fps_end = cv2.getTickCount()
+            fps = 30 / ((fps_end - fps_start) / cv2.getTickFrequency())
+            fps_start = fps_end
+            fps_counter = 0
+        
+        # Input handling
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
         elif key == ord('m'):
             mirrored = not mirrored
-            print(f"Mirror mode: {'ON' if mirrored else 'OFF'}")
+            print(f"Mirror: {'ON' if mirrored else 'OFF'}")
         elif key == ord('z'):
             show_zone = not show_zone
     
@@ -415,6 +390,6 @@ def main():
     mp_resources['face_mesh'].close()
     print("\nStopped.")
 
-# Make file import-friendly
+
 if __name__ == "__main__":
     main()
