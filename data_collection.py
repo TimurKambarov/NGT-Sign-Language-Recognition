@@ -3,13 +3,13 @@ NGT Sign Language Recognition - Data Collection Module
 Collects hand landmark sequences for training the classifier.
 
 Controls:
-    A-Y keys  : Select letter directly (press the letter you want, to select "R" press shift+"r")
+    A-Y keys  : Select letter directly 
     SPACE     : Record 100 frames
     1         : Quit and save
     2         : Toggle signing zone on/off
     3         : Toggle mirror mode
     4         : Show guide for current letter
-    R         : Reset dataset (requires confirmation) 
+    5         : Reset dataset 
 
 Output:
     - data/samples.csv: All collected samples
@@ -45,7 +45,7 @@ DATA_DIR = "data"
 OUTPUT_FILE = os.path.join(DATA_DIR, "samples.csv")
 
 # Recording settings
-FRAMES_PER_SAMPLE = 100  # Number of frames to record per sample (~3 sec at 30fps)
+FRAMES_PER_SAMPLE = 30  # Number of frames to record per sample (~3 sec at 30fps)
 
 # Static letters only (excluding dynamic: H, J, Z)
 STATIC_LETTERS = list("ABCDEFGIKLMNOPQRSTUVWXY")
@@ -204,7 +204,7 @@ def draw_letter_selector(frame, current_letter, sample_counts):
     cv2.rectangle(frame, (10, h - panel_height - 10), (w - 10, h - 10), COLOR_WHITE, 2)
     
     # Title
-    cv2.putText(frame, "Press letter key to select | SPACE=record | 1=quit | 2=zone | 3=mirror | 4=guide | R=reset",
+    cv2.putText(frame, "Press letter key to select | SPACE=record | 1=quit | 2=zone | 3=mirror | 4=guide | 5=reset",
                (20, h - panel_height + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, COLOR_WHITE, 1)
     
     # Draw letters in grid
@@ -368,7 +368,7 @@ def main():
     print("  2        : Toggle signing zone")
     print("  3        : Toggle mirror mode")
     print("  4        : Show guide for current letter")
-    print("  R        : Reset dataset")
+    print("  5        : Reset dataset")
     print()
     
     while True:
@@ -477,8 +477,8 @@ def main():
             else:
                 print("Guide not available (guide.py not found)")
         
-        # Key: R = Reset dataset
-        elif key == ord('r') and not is_recording:
+        # Key: 5 = Reset dataset
+        elif key == ord('5') and not is_recording:
             print("\n" + "=" * 60)
             print("WARNING: This will delete all collected data!")
             confirmation = input("Type 'reset' to confirm: ")
