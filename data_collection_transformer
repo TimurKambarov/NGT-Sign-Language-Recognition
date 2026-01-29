@@ -15,9 +15,9 @@ Data Format:
 Controls:
     0-9, A-Z  = Select letter
     SPACE     = Start/Stop recording
-    P         = Preview last recording
-    R         = Re-record last sample (delete and redo)
-    Q         = Quit and save
+    TAB       = Preview last recording
+    BACKSPACE = Delete last sample
+    ESC       = Quit and save
 
 Usage:
     1. Run script
@@ -38,8 +38,8 @@ from datetime import datetime
 # ============== CONFIGURATION ==============
 
 # Output - ABSOLUTE PATH to NGT folder
-DATA_DIR = r"C:\Users\Asus\Desktop\Sign language\NGT-Sign-Language-Recognition-\data"
-OUTPUT_FILE = os.path.join(DATA_DIR, "samples_merged.csv")
+DATA_DIR = "data"
+OUTPUT_FILE = "data/samples_merged.csv"
 
 # All 26 letters
 STATIC_LETTERS = list("ABCDEFGIKLMNOPQRSTUVWXY")  # 23 letters
