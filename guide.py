@@ -1,3 +1,6 @@
+'''
+Guide to help alphabet fingerspelling
+'''
 import cv2
 import os
 
