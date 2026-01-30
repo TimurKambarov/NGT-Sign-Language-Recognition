@@ -1,48 +1,23 @@
-"""
-NGT Sign Language Recognition - Real-Time LightGBM Inference
-Uses LightGBM model with feature engineering for real-time webcam prediction
-
-Controls:
-    Q - Quit
-    M - Toggle mirror mode
-    Z - Toggle signing zone visibility
-
-Usage:
-    python real_time_prediction_lightgbm.py
-"""
-
 import cv2
 import numpy as np
 import lightgbm as lgb
 import joblib
 import os
 from collections import deque
-
-try:
-    import hand_face_detection as detection
-except ImportError:
-    print("Error: hand_face_detection.py not found in current directory.")
-    print("Make sure you're running from the repository root.")
-    exit(1)
+import hand_face_detection as detection
 
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
+# Configuration
 
-# Model paths
-MODEL_PATH = "models/lightgbm_model.txt"
-LABEL_ENCODER_PATH = "models/label_encoder_lgbm.pkl"
-FEATURE_INFO_PATH = "models/feature_info.pkl"
+MODEL_PATH = "models/lightgbm_unified_model.txt"
+LABEL_ENCODER_PATH = "models/label_encoder_unified.pkl"
 
-# Sequence settings
-SEQUENCE_LENGTH = 10      # Collect 20 frames before prediction
-PREDICTION_INTERVAL = 5   # Predict every 5 frames
+SEQUENCE_LENGTH = 75
+MIN_FRAMES = 30
+PREDICTION_INTERVAL = 5
 
-# Prediction settings
 CONFIDENCE_THRESHOLD = 0.70
 
-# Signing zone boundaries (relative to face)
 SIGNING_ZONE = {
     'x_min': -2.5,
     'x_max': 2.5,
@@ -50,7 +25,6 @@ SIGNING_ZONE = {
     'y_max': 1.7,
 }
 
-# Display
 DISPLAY_FONT = cv2.FONT_HERSHEY_SIMPLEX
 COLOR_GREEN = (0, 255, 0)
 COLOR_RED = (0, 0, 255)
@@ -60,119 +34,115 @@ COLOR_CYAN = (255, 255, 0)
 COLOR_ORANGE = (0, 165, 255)
 
 
-# =============================================================================
-# MODEL LOADING
-# =============================================================================
+# Model Loading
 
 def load_model(model_path, label_encoder_path):
-    """Load trained LightGBM model and label encoder"""
+    """Load unified LightGBM model"""
     
     if not os.path.exists(model_path):
-        raise FileNotFoundError(
-            f"Model not found: {model_path}\n"
-            "Train the model first using the Jupyter notebook."
-        )
+        raise FileNotFoundError(f"Model not found: {model_path}")
     
     if not os.path.exists(label_encoder_path):
         raise FileNotFoundError(f"Label encoder not found: {label_encoder_path}")
     
-    # Load LightGBM model (native format)
     model = lgb.Booster(model_file=model_path)
-    
-    # Load label encoder
     label_encoder = joblib.load(label_encoder_path)
     
-    print(f"✓ Model loaded: {model_path}")
-    print(f"✓ Classes: {list(label_encoder.classes_)}")
+    print(f"Unified model loaded: {model_path}")
+    print(f"Supports {len(label_encoder.classes_)} letters: {list(label_encoder.classes_)}")
     
     return model, label_encoder
 
 
-# =============================================================================
-# FEATURE EXTRACTION (must match training!)
-# =============================================================================
+# Feature Extraction
 
-def extract_features(sequence):
+def extract_unified_features(seq_norm, seq_wrist_abs):
     """
-    Extract statistical features from sequence
+    Extract unified features for static + dynamic recognition
     
-    For each of 60 coordinates (excluding x0, y0, z0):
-    - Mean: Average value
-    - Std: Standard deviation
-    - Min: Minimum value
-    - Max: Maximum value
-    
-    Returns: 1D array of 240 features
-    
-    CHANGED: Skip first 3 columns (x0, y0, z0) - wrist is always (0, 0, 0)
+    Returns: 252 features
+    - 240 from normalized landmarks (mean, std, min, max for coords 3-62)
+    - 12 from absolute wrist positions (mean, std, min, max for x, y, z)
     """
     features = []
     
-    # Start from index 3 to skip wrist coordinates (always 0)
-    for coord_idx in range(3, sequence.shape[1]):  # Changed: start from 3 instead of 0
-        coord_values = sequence[:, coord_idx]
+    # Normalized landmark statistics (skip x0, y0, z0)
+    for coord_idx in range(3, seq_norm.shape[1]):
+        coord_values = seq_norm[:, coord_idx]
         
         features.append(np.mean(coord_values))
         features.append(np.std(coord_values))
         features.append(np.min(coord_values))
         features.append(np.max(coord_values))
     
-    return np.array(features).reshape(1, -1)  # Shape: (1, 240)
-
-
-# =============================================================================
-# SEQUENCE BUFFER
-# =============================================================================
-
-class SequenceBuffer:
-    """Maintains buffer of recent frames"""
+    # Absolute wrist statistics (key for dynamic detection!)
+    for coord_idx in range(3):
+        wrist_coord = seq_wrist_abs[:, coord_idx]
+        
+        features.append(np.mean(wrist_coord))
+        features.append(np.std(wrist_coord))
+        features.append(np.min(wrist_coord))
+        features.append(np.max(wrist_coord))
     
-    def __init__(self, max_length=20):
+    return np.array(features).reshape(1, -1)
+
+
+# Sequence Buffer with Wrist Tracking
+
+class UnifiedSequenceBuffer:
+    """Buffer that tracks both normalized landmarks and absolute wrist positions"""
+    
+    def __init__(self, max_length=75):
         self.max_length = max_length
-        self.frames = deque(maxlen=max_length)
+        self.frames_norm = deque(maxlen=max_length)
+        self.frames_wrist_abs = deque(maxlen=max_length)
     
-    def add_frame(self, landmarks_normalized):
-        """Add frame (21 landmarks with x, y, z)"""
-        frame_data = []
+    def add_frame(self, landmarks_normalized, landmarks_absolute):
+        """Add frame with both normalized and absolute data"""
+        # Normalized landmarks
+        frame_norm = []
         for lm in landmarks_normalized:
-            frame_data.extend([lm['x'], lm['y'], lm['z']])
-        self.frames.append(frame_data)
+            frame_norm.extend([lm['x'], lm['y'], lm['z']])
+        self.frames_norm.append(frame_norm)
+        
+        # Absolute wrist position (landmark 0 before normalization)
+        wrist_abs = landmarks_absolute[0]
+        self.frames_wrist_abs.append([wrist_abs['x'], wrist_abs['y'], wrist_abs['z']])
     
-    def get_sequence(self):
-        """Get sequence as numpy array (num_frames, 63)"""
-        if len(self.frames) == 0:
-            return None
-        return np.array(list(self.frames), dtype=np.float32)
+    def get_sequences(self):
+        """Get both sequences as numpy arrays"""
+        if len(self.frames_norm) == 0:
+            return None, None
+        
+        seq_norm = np.array(list(self.frames_norm), dtype=np.float32)
+        seq_wrist = np.array(list(self.frames_wrist_abs), dtype=np.float32)
+        
+        return seq_norm, seq_wrist
     
     def clear(self):
-        """Clear buffer"""
-        self.frames.clear()
+        """Clear both buffers"""
+        self.frames_norm.clear()
+        self.frames_wrist_abs.clear()
     
-    def is_ready(self):
-        """Check if buffer is full"""
-        return len(self.frames) >= self.max_length
+    def is_ready(self, min_frames=30):
+        """Check if enough frames collected"""
+        return len(self.frames_norm) >= min_frames
     
     def __len__(self):
-        return len(self.frames)
+        return len(self.frames_norm)
 
 
-# =============================================================================
-# PREDICTION
-# =============================================================================
+# Prediction
 
-def predict(model, sequence, label_encoder):
+def predict(model, seq_norm, seq_wrist_abs, label_encoder):
     """
-    Predict letter from sequence using LightGBM
+    Predict letter using unified features
     Returns: (predicted_letter, confidence)
     """
     
-    # Extract features from sequence
-    features = extract_features(sequence)
+    features = extract_unified_features(seq_norm, seq_wrist_abs)
+    predictions = model.predict(features)[0]
     
-    # Predict with LightGBM
-    predictions = model.predict(features)[0]  # Returns probabilities
-    
-    # Get best prediction
     predicted_idx = np.argmax(predictions)
     confidence = predictions[predicted_idx]
     predicted_letter = label_encoder.inverse_transform([predicted_idx])[0]
@@ -180,9 +150,7 @@ def predict(model, sequence, label_encoder):
     return predicted_letter, confidence
 
 
-# =============================================================================
-# SIGNING ZONE
-# =============================================================================
+# Signing Zone
 
 def is_in_signing_zone(relative_position):
     """Check if hand is in signing zone"""
@@ -214,18 +182,15 @@ def draw_signing_zone(frame, face_refs, show_zone=True):
     return frame
 
 
-# =============================================================================
-# DISPLAY
-# =============================================================================
+# Display
 
 def draw_prediction_box(frame, letter, confidence, buffer_size, in_zone):
     """Draw prediction result box"""
     h, w, _ = frame.shape
     
-    box_x, box_y = w - 200, 10
-    box_w, box_h = 190, 130
+    box_x, box_y = w - 220, 10
+    box_w, box_h = 210, 140
     
-    # Background
     cv2.rectangle(frame, (box_x, box_y), (box_x + box_w, box_y + box_h), (0, 0, 0), -1)
     cv2.rectangle(frame, (box_x, box_y), (box_x + box_w, box_y + box_h), COLOR_WHITE, 2)
     
@@ -237,26 +202,23 @@ def draw_prediction_box(frame, letter, confidence, buffer_size, in_zone):
     cv2.rectangle(frame, (box_x + 10, box_y + box_h - 20),
                  (box_x + box_w - 10, box_y + box_h - 10), COLOR_WHITE, 1)
     
-    # Display prediction or status
     if not in_zone:
-        cv2.putText(frame, "MOVE HAND", (box_x + 25, box_y + 45),
+        cv2.putText(frame, "MOVE HAND", (box_x + 35, box_y + 50),
                    DISPLAY_FONT, 0.6, COLOR_RED, 2)
-        cv2.putText(frame, "INTO ZONE", (box_x + 30, box_y + 70),
+        cv2.putText(frame, "INTO ZONE", (box_x + 40, box_y + 75),
                    DISPLAY_FONT, 0.6, COLOR_RED, 2)
     elif letter is None:
-        cv2.putText(frame, "Detecting...", (box_x + 30, box_y + 55),
+        cv2.putText(frame, "Detecting...", (box_x + 40, box_y + 60),
                    DISPLAY_FONT, 0.6, COLOR_YELLOW, 2)
     elif confidence < CONFIDENCE_THRESHOLD:
-        # Low confidence
-        cv2.putText(frame, f"{letter}?", (box_x + 60, box_y + 60),
+        cv2.putText(frame, f"{letter}?", (box_x + 70, box_y + 65),
                    DISPLAY_FONT, 1.8, COLOR_ORANGE, 3)
-        cv2.putText(frame, f"{confidence:.0%}", (box_x + 70, box_y + 90),
+        cv2.putText(frame, f"{confidence:.0%}", (box_x + 80, box_y + 95),
                    DISPLAY_FONT, 0.5, COLOR_ORANGE, 1)
     else:
-        # High confidence
-        cv2.putText(frame, letter, (box_x + 60, box_y + 65),
+        cv2.putText(frame, letter, (box_x + 70, box_y + 70),
                    DISPLAY_FONT, 2.2, COLOR_GREEN, 4)
-        cv2.putText(frame, f"{confidence:.0%}", (box_x + 70, box_y + 95),
+        cv2.putText(frame, f"{confidence:.0%}", (box_x + 80, box_y + 100),
                    DISPLAY_FONT, 0.6, COLOR_GREEN, 2)
     
     return frame
@@ -272,25 +234,21 @@ def draw_status_bar(frame, face_ok, hand_ok, in_zone, mirrored, fps):
     status += f"Zone:{'OK' if in_zone else 'NO'} Mirror:{'ON' if mirrored else 'OFF'} FPS:{fps:.0f}"
     
     cv2.putText(frame, status, (15, h - 17), DISPLAY_FONT, 0.4, COLOR_WHITE, 1)
-    cv2.putText(frame, "Q=quit M=mirror Z=zone", (350, h - 17), DISPLAY_FONT, 0.35, (150, 150, 150), 1)
+    cv2.putText(frame, "Q=quit M=mirror Z=zone | Unified: Static+Dynamic", (280, h - 17), 
+               DISPLAY_FONT, 0.35, (150, 150, 150), 1)
     
     return frame
 
 
-# =============================================================================
-# MAIN
-# =============================================================================
+# Main
 
 def main():
     
-    # Load model and label encoder
     model, label_encoder = load_model(MODEL_PATH, LABEL_ENCODER_PATH)
     
-    # Initialize detection
     print("\nInitializing MediaPipe...")
     mp_resources = detection.initialize_mediapipe()
     
-    # Initialize webcam
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Error: Could not open webcam.")
@@ -299,25 +257,23 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     
-    # State
-    sequence_buffer = SequenceBuffer(max_length=SEQUENCE_LENGTH)
+    sequence_buffer = UnifiedSequenceBuffer(max_length=SEQUENCE_LENGTH)
     
     mirrored = True
     show_zone = True
     frame_count = 0
     last_printed_letter = None
     
-    # Current prediction
     current_letter = None
     current_confidence = 0.0
     
-    # FPS tracking
     fps = 0
     fps_counter = 0
     fps_start = cv2.getTickCount()
     
-    print("\n✓ Ready! Controls: Q=quit, M=mirror, Z=zone")
-    print("Predictions appear when hand is in zone.\n")
+    print("\nReady! Unified model recognizes all 26 letters")
+    print("Controls: Q=quit, M=mirror, Z=zone")
+    print("Automatically handles both static and dynamic gestures\n")
     
     while True:
         ret, frame = cap.read()
@@ -327,68 +283,63 @@ def main():
         if mirrored:
             frame = cv2.flip(frame, 1)
         
-        # Detect face and hands
         frame, face_refs, hands_data = detection.process_frame(frame, mp_resources)
         
         face_ok = face_refs is not None
         hand_ok = len(hands_data) > 0
         in_zone = False
         
-        # Process hand if detected
         if hand_ok and face_ok:
             hand_data = hands_data[0]
             rel_pos = hand_data.get('relative_position')
             in_zone = is_in_signing_zone(rel_pos)
             
             if in_zone:
-                # Add frame to buffer
-                sequence_buffer.add_frame(hand_data['landmarks_normalized'])
+                # Add frame with both normalized and absolute landmarks
+                sequence_buffer.add_frame(
+                    hand_data['landmarks_normalized'],
+                    hand_data['landmarks']
+                )
                 
-                # Predict every 5 frames when buffer is ready
-                if sequence_buffer.is_ready() and frame_count % PREDICTION_INTERVAL == 0:
-                    sequence = sequence_buffer.get_sequence()
+                # Predict every N frames when buffer ready
+                if sequence_buffer.is_ready(MIN_FRAMES) and frame_count % PREDICTION_INTERVAL == 0:
+                    seq_norm, seq_wrist = sequence_buffer.get_sequences()
                     
-                    # Make prediction
-                    predicted_letter, confidence = predict(
-                        model, sequence, label_encoder
-                    )
-                    
-                    current_letter = predicted_letter
-                    current_confidence = confidence
-                    
-                    # Print to console on change (only high confidence)
-                    if (predicted_letter != last_printed_letter and 
-                        confidence >= CONFIDENCE_THRESHOLD):
-                        print(f"Detected: {predicted_letter} ({confidence:.0%})")
-                        last_printed_letter = predicted_letter
+                    if seq_norm is not None:
+                        predicted_letter, confidence = predict(
+                            model, seq_norm, seq_wrist, label_encoder
+                        )
+                        
+                        current_letter = predicted_letter
+                        current_confidence = confidence
+                        
+                        if (predicted_letter != last_printed_letter and 
+                            confidence >= CONFIDENCE_THRESHOLD):
+                            print(f"Detected: {predicted_letter} ({confidence:.0%})")
+                            last_printed_letter = predicted_letter
             else:
-                # Hand left zone - clear everything
                 sequence_buffer.clear()
                 current_letter = None
                 current_confidence = 0.0
                 last_printed_letter = None
         else:
-            # No detection - clear everything
             sequence_buffer.clear()
             current_letter = None
             current_confidence = 0.0
             last_printed_letter = None
         
-        # Draw UI
         frame = draw_signing_zone(frame, face_refs, show_zone)
         frame = draw_prediction_box(frame, current_letter, current_confidence,
                                     len(sequence_buffer), in_zone)
         frame = draw_status_bar(frame, face_ok, hand_ok, in_zone, mirrored, fps)
         
-        # Hand indicator
         if hand_ok:
             center = hands_data[0]['center_px']
             color = COLOR_GREEN if in_zone else COLOR_RED
             cv2.circle(frame, center, 8, color, -1)
         
-        cv2.imshow('NGT Sign Language Recognition - LightGBM', frame)
+        cv2.imshow('NGT Sign Language Recognition - Unified Model', frame)
         
-        # FPS calculation
         frame_count += 1
         fps_counter += 1
         if fps_counter >= 30:
@@ -397,7 +348,6 @@ def main():
             fps_start = fps_end
             fps_counter = 0
         
-        # Input handling
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
@@ -407,12 +357,11 @@ def main():
         elif key == ord('z'):
             show_zone = not show_zone
     
-    # Cleanup
     cap.release()
     cv2.destroyAllWindows()
     mp_resources['hands'].close()
     mp_resources['face_mesh'].close()
-    print("\n✓ Stopped.")
+    print("\nStopped.")
 
 
 if __name__ == "__main__":
